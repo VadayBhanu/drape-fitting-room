@@ -54,8 +54,8 @@ export function buildTopMesh(g, info, { k = 1, sign = 0, swayOff = 0 } = {}) {
   };
 
   const ys = [info.top, info.armY];
-  for (let i = 1; i <= 4; i++) ys.push(info.armY + (info.bottom - info.armY) * i / 4);
-  const xs = [info.srcL, info.cx, info.srcR];
+  for (let i = 1; i <= 8; i++) ys.push(info.armY + (info.bottom - info.armY) * i / 8);
+  const xs = [info.srcL, (info.srcL + info.cx) / 2, info.cx, (info.cx + info.srcR) / 2, info.srcR];
   const src = ys.map(y => xs.map(x => ({ x, y })));
   const torso = { src, dst: src.map(r => r.map(map)) };
 
@@ -72,14 +72,15 @@ export function buildTopMesh(g, info, { k = 1, sign = 0, swayOff = 0 } = {}) {
     const len = dist(mid(A, B), mid(C, D)) * s;
     const arm = arms[sl.side];
     const path = [mid(Ad, Bd), arm.el, arm.wr];
-    const sections = [0, 1 / 3, 2 / 3, 1].map(t => {
+    const TS = [0, 0.2, 0.4, 0.6, 0.8, 1];
+    const sections = TS.map(t => {
       if (t === 0) return [Ad, Bd];
       const { p, dir } = along(path, t * len);
       let n = { x: -dir.y, y: dir.x }; if (dot(n, seamV) < 0) n = mul(n, -1);
       const half = (1 - t) * dist(Ad, Bd) / 2 + t * dist(C, D) * s / 2;
       return [add(p, mul(n, -half)), add(p, mul(n, half))];
     });
-    const srcS = [0, 1 / 3, 2 / 3, 1].map(t => [lerp(A, D, t), lerp(B, C, t)]);
+    const srcS = TS.map(t => [lerp(A, D, t), lerp(B, C, t)]);
     return { side: sl.side, src: srcS, dst: sections };
   });
   return { torso, sleeves, map };
@@ -104,11 +105,11 @@ export function buildBottomMesh(g, info, { k = 1 } = {}) {
     const outerW = add(waist, mul(uh, sgn * waistW / 2 * k));
     const path = [mid(outerW, waist), knee, ank];
     const legLen = coverage * (dist(path[0], path[1]) + dist(path[1], path[2]));
-    const srcRows = [0, 0.5, 1].map(t => {
+    const srcRows = [0, 0.25, 0.5, 0.75, 1].map(t => {
       const y = info.top + (info.bottom - info.top) * t;
       return [{ x: outerX, y }, { x: info.cx, y }];
     });
-    const dstRows = [0, 0.5, 1].map(t => {
+    const dstRows = [0, 0.25, 0.5, 0.75, 1].map(t => {
       if (t === 0) return [outerW, waist];
       const { p, dir } = along(path, t * legLen);
       const n = norm({ x: -dir.y, y: dir.x });

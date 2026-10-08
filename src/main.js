@@ -30,7 +30,7 @@ document.body.append(video);
 const S = {
   phase:'idle', lm:null, lastSeen:0, lastT:0, hold:0, lock:null,
   top:CATALOG.tops[2], bottom:CATALOG.bottoms[0], editing:CATALOG.tops[2],
-  bag:[], sway:newSway(), hug:true,
+  bag:[], sway:newSway(), hug:true, fit:1,
   move:{on:false,list:[],i:0,hold:0,passedAt:0,done:false,sw:null},
 };
 let landmarker, rafHost = window, loopGen = 0, pipWin = null, patternMtx = new DOMMatrix();
@@ -215,7 +215,7 @@ function updateMask(m){
   const a = new Uint8ClampedArray(mw*mh);
   for (let y=0;y<mh;y++) for (let x=0;x<mw;x++) a[y*mw+x] = f[(y*step)*w + x*step] * 255;
   let dl = a;
-  for (let pass=0; pass<2; pass++){                       // grow the outline a little for a natural, not skin-tight, fit
+  for (let pass=0; pass<S.fit; pass++){                        // 0 = exact outline, 1 = fitted, 2 = relaxed
     const o = new Uint8ClampedArray(mw*mh);
     for (let y=0;y<mh;y++) for (let x=0;x<mw;x++){
       let v = 0;
@@ -477,7 +477,7 @@ function frame(now){
     for (const m of res.segmentationMasks || []) m.close();
     if (lm){
       if (!S.lm) S.lm = lm.map(p => ({...p}));
-      else for (let i=0;i<lm.length;i++){ const s=S.lm[i], n=lm[i]; s.x+=(n.x-s.x)*.55; s.y+=(n.y-s.y)*.55; s.z+=(n.z-s.z)*.55; s.visibility=n.visibility; }
+      else for (let i=0;i<lm.length;i++){ const s=S.lm[i], n=lm[i]; s.x+=(n.x-s.x)*.72; s.y+=(n.y-s.y)*.72; s.z+=(n.z-s.z)*.72; s.visibility=n.visibility; }
       S.lastSeen = now;
     } else if (now - S.lastSeen > 400) S.lm = null;
   }
@@ -612,6 +612,11 @@ document.addEventListener('paste', e => {
 $('#linkBtn').onclick = () => { const v = $('#linkInput').value.trim(); if (v) addFromLink(v); };
 $('#linkInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('#linkBtn').click(); });
 $('#hugToggle').addEventListener('change', e => { S.hug = e.target.checked; });
+$('#fitRow').addEventListener('click', e => {
+  const b = e.target.closest('[data-fit]'); if (!b) return;
+  S.fit = +b.dataset.fit;
+  for (const c of $('#fitRow').querySelectorAll('[data-fit]')) c.setAttribute('aria-pressed', String(c === b));
+});
 
 // shared from another app (installed app on Android)
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});

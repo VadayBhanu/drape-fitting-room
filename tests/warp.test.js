@@ -43,17 +43,17 @@ test('warp: sleeves follow the arms (up and out)', () => {
   const info = tee();
   const up = computeGeom(standingPose({ pose: 'up' }), W, H);
   for (const sl of buildTopMesh(up, info).sleeves) {
-    const tip = sl.dst[3][0];
+    const tip = sl.dst[sl.dst.length - 1][0];
     assert.ok(tip.y < up.sc.y, 'with arms raised, sleeve tips rise above the shoulders');
   }
   const out = computeGeom(standingPose({ pose: 'out' }), W, H);
-  const xs = buildTopMesh(out, info).sleeves.map(sl => sl.dst[3][0].x);
+  const xs = buildTopMesh(out, info).sleeves.map(sl => sl.dst[sl.dst.length - 1][0].x);
   assert.ok(Math.abs(xs[0] - xs[1]) > out.sw * 1.5, 'with arms out, sleeve tips spread wide');
 });
 
 test('warp: torso narrows when the person turns', () => {
   const g = computeGeom(standingPose(), W, H), info = tee();
-  const width = k => { const row = buildTopMesh(g, info, { k }).torso.dst[1]; return dist(row[0], row[2]); };
+  const width = k => { const row = buildTopMesh(g, info, { k }).torso.dst[1]; return dist(row[0], row[row.length - 1]); };
   assert.ok(width(0.5) < width(1) * 0.6);
 });
 
@@ -70,7 +70,7 @@ test('warp: trouser legs run from the waist to the ankles', () => {
   const { legs } = buildBottomMesh(g, info);
   assert.equal(legs.length, 2);
   for (const leg of legs) {
-    const end = leg.dst[2], ankleY = Math.max(g.la.y, g.ra.y);
+    const end = leg.dst[leg.dst.length - 1], ankleY = Math.max(g.la.y, g.ra.y);
     assert.ok(end[0].y > g.kc.y, 'hem below the knees');
     assert.ok(Math.abs(end[0].y - ankleY) < g.E * 1.2, 'hem near the ankles');
   }
@@ -80,15 +80,25 @@ test('warp: photo-left sleeve goes on the screen-left arm, and legs do not cross
   const g = computeGeom(standingPose({ pose: 'out' }), W, H);
   const sl = buildTopMesh(g, tee()).sleeves;
   const L = sl.find(s => s.side === 'L'), R = sl.find(s => s.side === 'R');
-  assert.ok(L.dst[3][0].x < g.sc.x && R.dst[3][0].x > g.sc.x);
+  assert.ok(L.dst[L.dst.length - 1][0].x < g.sc.x && R.dst[R.dst.length - 1][0].x > g.sc.x);
   const legs = buildBottomMesh(computeGeom(standingPose(), W, H), { kind: 'bottom', top: 0, bottom: 300, srcL: 30, srcR: 130, cx: 80 }).legs;
-  const hemL = legs.find(l => l.side === 'L').dst[2], hemR = legs.find(l => l.side === 'R').dst[2];
+  const hemL = legs.find(l => l.side === 'L').dst.at(-1), hemR = legs.find(l => l.side === 'R').dst.at(-1);
   assert.ok(Math.max(hemL[0].x, hemL[1].x) < Math.min(hemR[0].x, hemR[1].x));
 });
 
 test('warp: shorts stop above the knee, trousers reach the ankle', () => {
   const g = computeGeom(standingPose(), W, H);
-  const hem = h => buildBottomMesh(g, { kind: 'bottom', top: 0, bottom: h, srcL: 30, srcR: 130, cx: 80 }).legs[0].dst[2][0].y;
+  const hem = h => buildBottomMesh(g, { kind: 'bottom', top: 0, bottom: h, srcL: 30, srcR: 130, cx: 80 }).legs[0].dst.at(-1)[0].y;
   assert.ok(hem(100) < g.kc.y, 'shorts above the knee');
   assert.ok(hem(250) > g.kc.y + (g.la.y - g.kc.y) * 0.8, 'trousers near the ankle');
+});
+
+test('warp: meshes are dense enough to hug the body', () => {
+  const g = computeGeom(standingPose(), W, H), info = tee();
+  const mesh = buildTopMesh(g, info);
+  assert.equal(mesh.torso.src[0].length, 5, 'torso has 5 columns');
+  assert.equal(mesh.torso.src.length, 10, 'torso has 10 rows');
+  for (const sl of mesh.sleeves) assert.equal(sl.src.length, 6, 'sleeves have 6 sections');
+  const { legs } = buildBottomMesh(g, { kind: 'bottom', top: 0, bottom: 300, srcL: 30, srcR: 130, cx: 80 });
+  for (const leg of legs) assert.equal(leg.src.length, 5, 'legs have 5 rows');
 });

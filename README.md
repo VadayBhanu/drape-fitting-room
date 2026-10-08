@@ -8,6 +8,7 @@ Try clothes on through your camera, from any shop or your gallery, then turn and
 - Recognises you and guides you into frame.
 - Any clothing photo is cut out and warped onto your body as a mesh: the torso follows your shoulders and hips, sleeves bend with your arms, trousers follow your legs.
 - Clothes are shaped to your body outline (body segmentation) and your hands stay in front of them.
+- Fit tightness is adjustable: Exact hugs the outline, Fitted (default) allows a little ease, Relaxed drapes looser.
 - When you turn, the garment narrows and the far side falls into shadow. Long hems swing as you move.
 - Move test, beat, size estimate, snapshot, bag, and Float mode (desktop Chrome/Edge).
 
