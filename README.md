@@ -1,14 +1,34 @@
 # Drape: a live fitting room
 
-Try clothes on through your camera, then move in them to see how they hang.
+Try clothes on through your camera, from any shop or your gallery, then turn and move to see how they fit.
 
-1. **Stand in the frame.** Tape-measure guides and spoken-style prompts get your whole body in view, then it recognises you.
-2. **Try things on.** Garments are fitted to 33 tracked body points every frame. Sleeves go in front of or behind the body, patterns follow your angle, and hems swing when you move. Upload your own product photo to try it on.
-3. **Move in them.** A guided move test (arms up, arms out, hands on hips, turn, sway, lift a knee) with an optional beat.
+## Two ways to try on
 
-Also: size estimate from your height, snapshot, bag, and a **Float** mode that keeps the mirror on top of other tabs (desktop Chrome/Edge).
+**Live fit (real time, on your device)**
+- Recognises you and guides you into frame.
+- Any clothing photo is cut out and warped onto your body as a mesh: the torso follows your shoulders and hips, sleeves bend with your arms, trousers follow your legs.
+- Clothes are shaped to your body outline (body segmentation) and your hands stay in front of them.
+- When you turn, the garment narrows and the far side falls into shadow. Long hems swing as you move.
+- Move test, beat, size estimate, snapshot, bag, and Float mode (desktop Chrome/Edge).
 
-Everything runs in the browser. Camera frames never leave the device.
+**Real fit (photo-real, AI)**
+- Takes three photos as you turn: front, half-turn, side.
+- Sends each, with the clothing photo, to a virtual try-on model (IDM-VTON on Hugging Face by default) and shows you wearing it from each angle, with a slider to turn around.
+- Works with any product photo, including ones worn by a model.
+- Uses Hugging Face's free GPU queue: about 30-90 seconds per view. Add your own Hugging Face token in Real fit settings to raise the daily limit. Upper-body clothes give the best results with the default model.
+
+## Picking clothes from anywhere
+
+- **From gallery**: any saved photo.
+- **Paste**: on a shop page (Amazon or any site) right-click or long-press the clothing photo, choose Copy image, then Paste in Drape (or Ctrl+V).
+- **Link**: paste an image link. Some sites block live preview of their images; Real fit can still use the link because the try-on service downloads it.
+- **Share (Android)**: install Drape from the browser menu, then use Share, Drape from your gallery or browser.
+
+Product pages themselves can't be read automatically (shops block it), so copy the photo rather than the page link.
+
+## Privacy
+
+Live fit never sends video anywhere. Real fit sends the three captured photos and the clothing photo to the try-on Space you choose, only after you press Start real fit. A Hugging Face token you enter is stored only in your browser.
 
 ## Run locally
 
@@ -26,7 +46,7 @@ npm run check      # lint + unit tests
 npm test           # unit tests only
 ```
 
-Tests use synthetic body poses to check positioning prompts (including mirrored left/right), body geometry, every move-test pose, size thresholds, the hem spring, the catalogue, and that every element and button the script uses exists in the page.
+Tests use synthetic body poses and synthetic garment shapes to check: positioning prompts (with mirrored left/right), body geometry, every move-test pose, size thresholds, the hem spring, reading a garment photo (sleeves, sleeveless, long dress, trousers), the mesh warp (exact corner mapping, sleeves joined to the torso, sleeves following raised and spread arms, the correct arm per side, narrowing when turning, shorts vs trouser length), real-fit cropping and error messages, the share target, and that every element and button the script uses exists.
 
 ## Deploy to GitHub Pages
 
@@ -50,6 +70,10 @@ styles.css          styles (dark fitting-room look, mobile rules)
 src/main.js         camera, tracking, drawing, UI
 src/geometry.js     pure logic: body frame, positioning, sizing, move checks, hem spring
 src/catalog.js      products on the rail (replace with your store's feed)
+src/garment.js      cut out a clothing photo and find torso, sleeves, hem, legs
+src/warp.js         triangle-mesh warp of the photo onto the body, turning
+src/realfit.js      photo-real try-on through a Hugging Face Space
+sw.js, manifest     installable app + "Share to Drape"
 tests/              node:test unit tests
 ```
 
@@ -59,4 +83,4 @@ Edit `src/catalog.js`. Each item needs an `id`, `name`, `price`, a `type` (`tee`
 
 ## Limits
 
-Clothes are drawn as 2D shapes on top of the camera image, not simulated 3D cloth. Hands can't appear in front of a garment yet, and the size estimate is approximate.
+Live fit is a 2D warp of a photo, so it can't show the back of a garment, and very loose or layered clothes won't drape like real fabric. Real fit is photo-real but takes seconds per image, not live video, and depends on the free Space being available. Size estimates are approximate.

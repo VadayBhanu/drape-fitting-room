@@ -136,3 +136,20 @@ body.pip .tool[data-act="float"]{display:none}
   .start h2{font-size:22px}
 }
 @media (prefers-reduced-motion:reduce){.mirror{box-shadow:0 30px 60px -20px rgba(0,0,0,.6)!important}}
+
+/* sources + real fit */
+.check{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--muted);margin-top:12px}
+.source-row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.file-btn{position:relative;overflow:hidden;display:inline-flex;align-items:center}
+.file-btn input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.link-field{margin-top:4px}
+.link-field input{flex:1;width:auto;min-width:0}
+.stack{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);margin-top:10px}
+.stack input{padding:9px 10px;border-radius:8px;border:1px solid rgba(201,163,91,.45);background:rgba(0,0,0,.25)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.turntable{margin-top:12px}
+.turntable img{width:100%;aspect-ratio:3/4;object-fit:cover;border-radius:120px 120px 12px 12px / 70px 70px 12px 12px;border:3px solid var(--brass);background:#140a14;display:block}
+.turntable input[type=range]{width:100%;accent-color:var(--brass)}
+.rf-label{text-align:center;font-weight:700;margin:6px 0 0}
+.settings{margin-top:12px;font-size:14px}
+.settings summary{cursor:pointer;color:var(--muted)}

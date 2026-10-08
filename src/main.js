@@ -2,6 +2,9 @@ import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 import { add, sub, mul, lerp, mid, access, computeGeom, positionCheck, sizeEstimate,
   bodyPxFromSpan, swayStep, newSway, MOVE_CHECKS, swayProgress } from "./geometry.js";
 import { CATALOG, OPTS } from "./catalog.js";
+import { cutBackground } from "./garment.js";
+import { buildTopMesh, buildBottomMesh, drawGrid, estimateYaw } from "./warp.js";
+import { runTryOn, cropBoxForPerson, explainError, DEFAULT_SPACE } from "./realfit.js";
 window.__drapeReady = true;
 
 const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
@@ -9,7 +12,16 @@ const IS_PHONE = matchMedia("(pointer:coarse)").matches && Math.min(screen.width
 const MODEL = `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${IS_PHONE?"lite":"full"}/float16/1/pose_landmarker_${IS_PHONE?"lite":"full"}.task`;
 
 const $ = s => document.querySelector(s);
-const canvas = $('#view'), ctx = canvas.getContext('2d');
+const canvas = $('#view'), viewCtx = canvas.getContext('2d');
+let ctx = viewCtx;                          // garment drawing targets this; swapped to the layer canvas
+const mk = () => document.createElement('canvas');
+const layer = mk(), layerCtx = layer.getContext('2d');     // garments, before compositing
+const hug = mk(), hugCtx = hug.getContext('2d');           // body outline used to shape clothes
+const hands = mk(), handsCtx = hands.getContext('2d');     // hands redrawn on top of clothes
+const shapes = mk(), shapesCtx = shapes.getContext('2d');
+const raw = mk(), rawCtx = raw.getContext('2d');           // clean mirrored frame for real fit
+const maskBody = mk(), maskDil = mk();
+let maskOK = false;
 const video = Object.assign(document.createElement('video'), { playsInline:true, muted:true, autoplay:true });
 video.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none';
 document.body.append(video);
@@ -18,7 +30,7 @@ document.body.append(video);
 const S = {
   phase:'idle', lm:null, lastSeen:0, lastT:0, hold:0, lock:null,
   top:CATALOG.tops[2], bottom:CATALOG.bottoms[0], editing:CATALOG.tops[2],
-  bag:[], sway:newSway(),
+  bag:[], sway:newSway(), hug:true,
   move:{on:false,list:[],i:0,hold:0,passedAt:0,done:false,sw:null},
 };
 let landmarker, rafHost = window, loopGen = 0, pipWin = null, patternMtx = new DOMMatrix();
@@ -195,19 +207,116 @@ function drawImageTop(g, item){
   ctx.drawImage(img, -w/2, 0, w, h); ctx.restore();
 }
 
+/* ---------- body outline from the segmentation mask ---------- */
+function updateMask(m){
+  if (!m){ maskOK = false; return; }
+  const w = m.width, h = m.height, f = m.getAsFloat32Array();
+  const step = Math.max(1, Math.round(w / 200)), mw = Math.floor(w/step), mh = Math.floor(h/step);
+  const a = new Uint8ClampedArray(mw*mh);
+  for (let y=0;y<mh;y++) for (let x=0;x<mw;x++) a[y*mw+x] = f[(y*step)*w + x*step] * 255;
+  let dl = a;
+  for (let pass=0; pass<2; pass++){                       // grow the outline a little for a natural, not skin-tight, fit
+    const o = new Uint8ClampedArray(mw*mh);
+    for (let y=0;y<mh;y++) for (let x=0;x<mw;x++){
+      let v = 0;
+      for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++){
+        const yy=y+dy, xx=x+dx; if (yy<0||xx<0||yy>=mh||xx>=mw) continue;
+        const q = dl[yy*mw+xx]; if (q>v) v=q;
+      }
+      o[y*mw+x] = v;
+    }
+    dl = o;
+  }
+  for (const [cv, data] of [[maskBody, a],[maskDil, dl]]){
+    if (cv.width !== mw || cv.height !== mh){ cv.width = mw; cv.height = mh; }
+    const c2 = cv.getContext('2d'), id = c2.createImageData(mw, mh);
+    for (let i=0;i<data.length;i++) id.data[i*4+3] = data[i];
+    c2.putImageData(id, 0, 0);
+  }
+  maskOK = true;
+}
+function drawMirrored(c, src){
+  c.save(); c.translate(W(),0); c.scale(-1,1); c.imageSmoothingEnabled = true; c.drawImage(src, 0, 0, W(), H()); c.restore();
+}
+
+/* ---------- garments from photos ---------- */
+const armSideOf = (g, sleeveSide) => ((sleeveSide==='L') === (g.ls.x <= g.rs.x)) ? 'L' : 'R';
+function drawGarmentTop(g, item, yaw){
+  if (!item.info){ drawImageTop(g, item); return; }
+  const mesh = buildTopMesh(g, item.info, { k:yaw.k, sign:yaw.sign, swayOff:g.swayOff });
+  const front = sl => armInFront(g, armSideOf(g, sl.side));
+  for (const sl of mesh.sleeves) if (!front(sl)) drawGrid(ctx, item.img, sl.src, sl.dst);
+  drawGrid(ctx, item.img, mesh.torso.src, mesh.torso.dst);
+  for (const sl of mesh.sleeves) if (front(sl)) drawGrid(ctx, item.img, sl.src, sl.dst);
+}
+function drawGarmentBottom(g, item, yaw){
+  if (!g.hipVis || !item.info) return;
+  for (const leg of buildBottomMesh(g, item.info, { k:yaw.k }).legs) drawGrid(ctx, item.img, leg.src, leg.dst);
+}
+
 function drawOutfit(g, dt){
   swayStep(S.sway, g.hc.x, dt, g.E); g.swayOff = S.sway.off;
   patternMtx = new DOMMatrix().translateSelf(g.sc.x,g.sc.y).rotateSelf(Math.atan2(g.u.y,g.u.x)*180/Math.PI).scaleSelf(g.E/180);
-  const top = S.top;
-  if (top.type !== 'dress' && S.bottom) pants(g, S.bottom);
-  if (top.type === 'image'){ drawImageTop(g, top); return; }
-  const o = OPTS[top.type];
-  const front = {L:armInFront(g,'L'), R:armInFront(g,'R')};
-  for (const s of ['L','R']) if (!front[s]) sleeve(g, s, top, o);
-  const t = torsoPath(g, o);
-  fillShaded(t.p, top, g);
-  details(g, top, t);
-  for (const s of ['L','R']) if (front[s]) sleeve(g, s, top, o);
+  const yaw = estimateYaw(g, S.lock && S.lock.sw, S.lm[11].z - S.lm[12].z);
+  const top = S.top, bottom = top.type === 'dress' ? null : S.bottom;
+  layerCtx.clearRect(0,0,W(),H());
+  ctx = layerCtx;
+  try {
+    if (bottom){ if (bottom.type === 'garment') drawGarmentBottom(g, bottom, yaw); else if (bottom.type === 'pants') pants(g, bottom); }
+    if (top.type === 'garment') drawGarmentTop(g, top, yaw);
+    else if (top.type !== 'remote'){
+      const o = OPTS[top.type];
+      const front = {L:armInFront(g,'L'), R:armInFront(g,'R')};
+      for (const s of ['L','R']) if (!front[s]) sleeve(g, s, top, o);
+      const t = torsoPath(g, o);
+      fillShaded(t.p, top, g);
+      details(g, top, t);
+      for (const s of ['L','R']) if (front[s]) sleeve(g, s, top, o);
+    }
+  } finally { ctx = viewCtx; }
+
+  // keep clothes on the body outline above the hips (loose hems below the hips stay free)
+  if (maskOK && S.hug){
+    hugCtx.clearRect(0,0,W(),H());
+    drawMirrored(hugCtx, maskDil);
+    const far = Math.max(W(), H()) * 2;
+    const a = add(g.hc, mul(g.uh, far)), b = add(g.hc, mul(g.uh, -far));
+    hugCtx.fillStyle = '#000'; hugCtx.beginPath();
+    hugCtx.moveTo(a.x,a.y); hugCtx.lineTo(b.x,b.y); hugCtx.lineTo(b.x+g.d.x*far, b.y+g.d.y*far); hugCtx.lineTo(a.x+g.d.x*far, a.y+g.d.y*far);
+    hugCtx.closePath(); hugCtx.fill();
+    layerCtx.globalCompositeOperation = 'destination-in'; layerCtx.drawImage(hug, 0, 0);
+  }
+  // turning: the far side of the body falls into shadow
+  layerCtx.globalCompositeOperation = 'source-atop';
+  const p0 = add(g.sc, mul(g.u, g.E)), p1 = add(g.sc, mul(g.u, -g.E));
+  const gr = layerCtx.createLinearGradient(p0.x,p0.y,p1.x,p1.y), turn = (1 - yaw.k) * 0.5;
+  const left = yaw.sign > 0 ? turn : 0, right = yaw.sign < 0 ? turn : 0;
+  gr.addColorStop(0, `rgba(0,0,0,${0.2 + left})`); gr.addColorStop(.3,'rgba(0,0,0,0)');
+  gr.addColorStop(.7,'rgba(0,0,0,0)'); gr.addColorStop(1, `rgba(0,0,0,${0.2 + right})`);
+  layerCtx.fillStyle = gr; layerCtx.fillRect(0,0,W(),H());
+  layerCtx.globalCompositeOperation = 'source-over';
+  viewCtx.drawImage(layer, 0, 0);
+
+  // hands (and forearms reaching forward) stay in front of the clothes
+  if (maskOK){
+    shapesCtx.clearRect(0,0,W(),H()); shapesCtx.fillStyle = shapesCtx.strokeStyle = '#000'; shapesCtx.lineCap = 'round';
+    let any = false;
+    for (const sd of ['L','R']){
+      const wv = sd==='L' ? g.lwV : g.rwV; if (!wv) continue;
+      const el = sd==='L' ? g.le : g.re, wr = sd==='L' ? g.lw : g.rw;
+      const hand = add(wr, mul(sub(wr, el), 0.35));
+      shapesCtx.beginPath(); shapesCtx.arc(hand.x, hand.y, g.E*0.27, 0, 7); shapesCtx.fill(); any = true;
+      if (armInFront(g, sd)){ shapesCtx.lineWidth = g.E*0.34; shapesCtx.beginPath(); shapesCtx.moveTo(el.x,el.y); shapesCtx.lineTo(hand.x,hand.y); shapesCtx.stroke(); }
+    }
+    if (any){
+      handsCtx.globalCompositeOperation = 'source-over'; handsCtx.clearRect(0,0,W(),H());
+      drawMirrored(handsCtx, video);
+      handsCtx.globalCompositeOperation = 'destination-in'; drawMirrored(handsCtx, maskBody);
+      handsCtx.drawImage(shapes, 0, 0);
+      handsCtx.globalCompositeOperation = 'source-over';
+      viewCtx.drawImage(hands, 0, 0);
+    }
+  }
 }
 
 /* ---------- positioning ---------- */
@@ -247,6 +356,7 @@ function lockOn(full, span){
   setTimeout(()=>{ if (S.phase==='tryon' && !S.move.on) setPrompt(''); }, 2600);
   for (const b of document.querySelectorAll('.tool[data-act="prev"],.tool[data-act="next"],.tool[data-act="photo"]')) b.disabled = false;
   $('#moveBtn').disabled = false; $('#addBag').disabled = false;
+  updateRealFitButton();
   updateSize();
 }
 
@@ -363,6 +473,8 @@ function frame(now){
   if (landmarker && video.readyState >= 2){
     const res = landmarker.detectForVideo(video, now);
     const lm = res.landmarks && res.landmarks[0];
+    updateMask(res.segmentationMasks && res.segmentationMasks[0]);
+    for (const m of res.segmentationMasks || []) m.close();
     if (lm){
       if (!S.lm) S.lm = lm.map(p => ({...p}));
       else for (let i=0;i<lm.length;i++){ const s=S.lm[i], n=lm[i]; s.x+=(n.x-s.x)*.55; s.y+=(n.y-s.y)*.55; s.z+=(n.z-s.z)*.55; s.visibility=n.visibility; }
@@ -385,6 +497,7 @@ function frame(now){
     if (!S.lm && now - S.lastSeen > 2000) setPrompt('Step back into the frame.', 'warn');
     else if ($('#prompt').dataset.tone === 'warn') setPrompt('');
     updateMoves(g, dt, now);
+    if (RF.capturing) updateRealFitCapture(g, dt);
   }
   scheduleBeat();
 }
@@ -408,11 +521,12 @@ async function start(){
     btn.disabled = false; return;
   }
   canvas.width = video.videoWidth || 1280; canvas.height = video.videoHeight || 720;
+  for (const c of [layer, hug, hands, shapes, raw]) { c.width = canvas.width; c.height = canvas.height; }
   $('#glass').style.setProperty('--ar', `${canvas.width}/${canvas.height}`);
   setPrompt('Loading body tracking…');
   try {
     const fs = await FilesetResolver.forVisionTasks(WASM);
-    const make = delegate => PoseLandmarker.createFromOptions(fs, { baseOptions:{ modelAssetPath:MODEL, delegate }, runningMode:'VIDEO', numPoses:1 });
+    const make = delegate => PoseLandmarker.createFromOptions(fs, { baseOptions:{ modelAssetPath:MODEL, delegate }, runningMode:'VIDEO', numPoses:1, outputSegmentationMasks:true });
     landmarker = await make('GPU').catch(() => make('CPU'));
   } catch {
     setPrompt('Body tracking could not load. Check your connection and reload.', 'warn'); return;
@@ -444,41 +558,144 @@ async function float(){
 }
 function toastFloat(t){ $('#floatNote').textContent = t; }
 
-/* ---------- own product photo ---------- */
-function cutBackground(img){
-  const max = 640, sc = Math.min(1, max/Math.max(img.width,img.height));
-  const w = Math.round(img.width*sc), h = Math.round(img.height*sc);
-  const c = document.createElement('canvas'); c.width=w; c.height=h;
-  const g = c.getContext('2d'); g.drawImage(img,0,0,w,h);
-  const id = g.getImageData(0,0,w,h), d = id.data, seen = new Uint8Array(w*h);
-  const ref = [d[0],d[1],d[2]], tol = 110;
-  const stack = [0, w-1, (h-1)*w, h*w-1];
-  while (stack.length){
-    const i = stack.pop(); if (i<0 || i>=w*h || seen[i]) continue; seen[i]=1;
-    const k = i*4, diff = Math.abs(d[k]-ref[0])+Math.abs(d[k+1]-ref[1])+Math.abs(d[k+2]-ref[2]);
-    if (d[k+3] > 10 && diff > tol) continue;
-    d[k+3] = 0;
-    const x = i % w;
-    if (x>0) stack.push(i-1); if (x<w-1) stack.push(i+1); stack.push(i-w, i+w);
-  }
-  g.putImageData(id,0,0);
-  let x0=w,y0=h,x1=0,y1=0;
-  for (let y=0;y<h;y++) for (let x=0;x<w;x++) if (d[(y*w+x)*4+3]>10){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
-  if (x1<=x0 || y1<=y0) return c;
-  const out = document.createElement('canvas'); out.width=x1-x0+1; out.height=y1-y0+1;
-  out.getContext('2d').drawImage(c, x0,y0,out.width,out.height, 0,0,out.width,out.height);
-  return out;
+/* ---------- pick any clothes: gallery, paste, link, share ---------- */
+const IMG_URL = /\.(jpe?g|png|webp|avif|gif)(\?|#|$)|\/images\/I\/|m\.media-amazon\.com/i;
+async function addGarment(blob, { name = 'Your pick', url = null } = {}){
+  let bmp;
+  try { bmp = await createImageBitmap(blob); }
+  catch { setPrompt('That file is not an image this browser can open. Try a JPG or PNG.', 'warn'); return; }
+  const { canvas: cut, info } = cutBackground(bmp);
+  const item = { id:'g'+Date.now(), name, price:'', type:'garment', img:cut, info, blob, url,
+    thumb: cut.toDataURL('image/png'), ci:0, colors:[{ name:'As photographed', base:'#777777' }] };
+  if (info && info.kind === 'bottom'){ CATALOG.bottoms.push(item); S.bottom = item; }
+  else { CATALOG.tops.push(item); S.top = item; }
+  S.editing = item; renderCatalog(); updateRealFitButton();
+  if (!info) setPrompt('Could not find the clothing outline in that photo. Real fit can still use it.', 'warn');
+  else setPrompt(info.kind === 'bottom' ? 'Added to bottoms.' : 'Added. Step back to see it on you.');
 }
-$('#upload').addEventListener('change', e => {
-  const f = e.target.files[0]; if (!f) return;
-  const img = new Image();
-  img.onload = () => {
-    const item = { id:'own'+Date.now(), name:'Your product', price:'', type:'image', img:cutBackground(img), ci:0, colors:[{name:'As photographed', base:'#777'}] };
-    CATALOG.tops.push(item); S.top = item; S.editing = item; renderCatalog();
-    URL.revokeObjectURL(img.src);
-  };
-  img.src = URL.createObjectURL(f);
+function addRemote(url){
+  const item = { id:'r'+Date.now(), name:'Linked photo', price:'', type:'remote', url, thumb:url, ci:0, colors:[{ name:'As linked', base:'#777777' }] };
+  CATALOG.tops.push(item); S.top = item; S.editing = item; renderCatalog(); updateRealFitButton();
+  setPrompt('This site blocks live preview of its images. Real fit can still use the link.', 'warn');
+}
+async function addFromLink(raw){
+  const url = (raw.match(/https?:\/\/\S+/) || [])[0];
+  if (!url){ setPrompt('Paste a link that starts with http.', 'warn'); return; }
+  try {
+    const r = await fetch(url, { mode:'cors' });
+    const type = r.headers.get('content-type') || '';
+    if (r.ok && type.startsWith('image/')) { await addGarment(await r.blob(), { url, name:'Linked photo' }); return; }
+    if (r.ok) { setPrompt('That is a web page, not a photo. On the product, long-press or right-click the clothing image, choose Copy image, then Paste here.', 'warn'); return; }
+  } catch { /* blocked by the site: fall through */ }
+  if (IMG_URL.test(url)) addRemote(url);
+  else setPrompt('That is a product page. Long-press or right-click the clothing photo, choose Copy image (or Copy image address), then paste it here.', 'warn');
+}
+$('#upload').addEventListener('change', e => { const f = e.target.files[0]; if (f) addGarment(f, { name: f.name.replace(/\.\w+$/, '').slice(0, 28) || 'Your pick' }); e.target.value = ''; });
+$('#pasteBtn').onclick = async () => {
+  try {
+    for (const it of await navigator.clipboard.read()){
+      const t = it.types.find(x => x.startsWith('image/'));
+      if (t){ await addGarment(await it.getType(t), { name:'Pasted photo' }); return; }
+      if (it.types.includes('text/plain')){ await addFromLink(await (await it.getType('text/plain')).text()); return; }
+    }
+    setPrompt('Nothing to paste. Copy a clothing photo first.', 'warn');
+  } catch { setPrompt('Press Ctrl+V (or long-press and Paste) to paste the copied photo.', 'warn'); }
+};
+document.addEventListener('paste', e => {
+  if (e.target.closest && e.target.closest('input')) return;
+  const items = [...(e.clipboardData?.items || [])];
+  const img = items.find(i => i.type.startsWith('image/'));
+  if (img){ e.preventDefault(); addGarment(img.getAsFile(), { name:'Pasted photo' }); return; }
+  const txt = e.clipboardData?.getData('text');
+  if (txt && /https?:\/\//.test(txt)){ e.preventDefault(); addFromLink(txt); }
 });
+$('#linkBtn').onclick = () => { const v = $('#linkInput').value.trim(); if (v) addFromLink(v); };
+$('#linkInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('#linkBtn').click(); });
+$('#hugToggle').addEventListener('change', e => { S.hug = e.target.checked; });
+
+// shared from another app (installed app on Android)
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+(async () => {
+  if (!new URLSearchParams(location.search).has('shared') || !('caches' in window)) return;
+  history.replaceState(null, '', location.pathname);
+  const cache = await caches.open('drape-share');
+  const img = await cache.match('shared-image'), txt = await cache.match('shared-text');
+  if (img) await addGarment(await img.blob(), { name:'Shared photo' });
+  else if (txt) await addFromLink(await txt.text());
+  await cache.delete('shared-image'); await cache.delete('shared-text');
+})();
+
+/* ---------- real fit: photo-real try-on from three angles ---------- */
+const RF = { capturing:false, i:0, hold:0, shots:[], results:[], busy:false };
+const RF_STEPS = [
+  { label:'Front',     prompt:'Face the camera and hold still.',        ok:y => y.k > 0.85 },
+  { label:'Half turn', prompt:'Turn halfway to your side and hold.',    ok:y => y.k < 0.8 && y.k > 0.5 },
+  { label:'Side',      prompt:'Turn fully to your side and hold.',      ok:y => y.k < 0.5 },
+];
+const tokenKey = 'drape.hfToken', spaceKey = 'drape.space';
+try { $('#hfToken').value = localStorage.getItem(tokenKey) || ''; $('#rfSpace').value = localStorage.getItem(spaceKey) || DEFAULT_SPACE; }
+catch { $('#rfSpace').value = DEFAULT_SPACE; }
+$('#hfToken').addEventListener('change', e => { try { localStorage.setItem(tokenKey, e.target.value.trim()); } catch { /* storage off */ } });
+$('#rfSpace').addEventListener('change', e => { try { localStorage.setItem(spaceKey, e.target.value.trim()); } catch { /* storage off */ } });
+
+function realFitGarment(){ return ['garment','remote'].includes(S.top.type) ? S.top : null; }
+function updateRealFitButton(){
+  const ok = !!S.lock && !!realFitGarment() && !RF.busy && !RF.capturing;
+  $('#rfBtn').disabled = !ok;
+  $('#rfHint').textContent = !realFitGarment() ? 'Pick a clothing photo first (gallery, paste or link).'
+    : !S.lock ? 'Stand in the frame first.' : 'Takes three photos as you turn, then makes each view.';
+}
+function startRealFit(){
+  Object.assign(RF, { capturing:true, i:0, hold:0, shots:[] });
+  S.move.on = false; $('#moveCard').hidden = true;
+  updateRealFitButton(); setPrompt(RF_STEPS[0].prompt);
+}
+function updateRealFitCapture(g, dt){
+  if (!g) return;
+  const step = RF_STEPS[RF.i], yaw = estimateYaw(g, S.lock.sw, S.lm[11].z - S.lm[12].z);
+  RF.hold = step.ok(yaw) ? RF.hold + dt : Math.max(0, RF.hold - dt);
+  setPrompt(RF.hold > 0 ? `${step.label}: hold still…` : step.prompt);
+  if (RF.hold < 0.7) return;
+  RF.shots.push(captureShot(g)); RF.i++; RF.hold = 0;
+  if (RF.i >= RF_STEPS.length){ RF.capturing = false; setPrompt('Photos taken. Making your real fit…'); processRealFit(); }
+}
+function captureShot(){
+  rawCtx.clearRect(0,0,W(),H()); drawMirrored(rawCtx, video);
+  let x0 = W(), y0 = H(), x1 = 0, y1 = 0;
+  for (let i = 0; i < 33; i++) if (vis(i, .3)){ const p = P(i); x0 = Math.min(x0,p.x); y0 = Math.min(y0,p.y); x1 = Math.max(x1,p.x); y1 = Math.max(y1,p.y); }
+  const g = geom(), head = g ? g.E * 0.6 : 60;
+  const box = cropBoxForPerson({ x0, y0: Math.max(0, y0 - head), x1, y1 }, W(), H());
+  const out = mk(); out.width = 768; out.height = 1024;
+  const oc = out.getContext('2d'); oc.fillStyle = '#fff'; oc.fillRect(0,0,768,1024);
+  oc.drawImage(raw, box.x, box.y, box.w, box.h, 0, 0, 768, 1024);
+  return new Promise(res => out.toBlob(res, 'image/jpeg', 0.9));
+}
+async function processRealFit(){
+  const item = realFitGarment(); if (!item) return;
+  RF.busy = true; RF.results = []; updateRealFitButton();
+  $('#rfResults').hidden = false; renderRealFit();
+  const token = $('#hfToken').value.trim(), space = $('#rfSpace').value.trim() || DEFAULT_SPACE;
+  try {
+    for (let i = 0; i < RF.shots.length; i++){
+      const person = await RF.shots[i];
+      const url = await runTryOn({ person, garment: item.blob || item.url, description: $('#rfDesc').value.trim(), space, token,
+        onStatus: st => { $('#rfStatus').textContent = `${RF_STEPS[i].label} view (${i+1} of ${RF.shots.length}): ${st}`; } });
+      RF.results.push({ label: RF_STEPS[i].label, url }); renderRealFit(RF.results.length - 1);
+    }
+    $('#rfStatus').textContent = 'Done. Drag the slider to turn around.';
+    setPrompt('Your real fit is ready.');
+  } catch (e){
+    $('#rfStatus').textContent = explainError(e); setPrompt('Real fit stopped. See the panel for why.', 'warn');
+  } finally { RF.busy = false; updateRealFitButton(); }
+}
+function renderRealFit(i = RF.results.length - 1){
+  const sl = $('#rfSlider'); sl.max = Math.max(0, RF.results.length - 1); sl.disabled = RF.results.length < 2;
+  if (i < 0){ $('#rfImg').hidden = true; $('#rfLabel').textContent = ''; return; }
+  sl.value = i; $('#rfImg').hidden = false; $('#rfImg').src = RF.results[i].url;
+  $('#rfLabel').textContent = RF.results[i].label;
+}
+$('#rfSlider').addEventListener('input', e => renderRealFit(+e.target.value));
+$('#rfBtn').onclick = startRealFit;
 
 /* ---------- UI ---------- */
 function setPrompt(t, tone){ const p = $('#prompt'); if (p.textContent !== t) p.textContent = t; p.dataset.tone = tone || ''; }
@@ -488,7 +705,7 @@ function setStep(n){
   }
 }
 function swatchBg(item){
-  if (item.type==='image') return `center/cover url(${item.img.toDataURL()})`;
+  if (item.type==='garment' || item.type==='remote') return `center/contain no-repeat url("${item.thumb}"), #f4f0ea`;
   const c = item.colors[item.ci];
   return c.accent ? `linear-gradient(135deg, ${c.base} 50%, ${c.accent} 50%)` : c.base;
 }
@@ -505,7 +722,7 @@ function renderCatalog(){
     }
   }
   const it = S.editing, box = $('#colours'); box.innerHTML = '';
-  if (it && it.type !== 'image' && it.colors.length > 1){
+  if (it && !['garment','remote'].includes(it.type) && it.colors.length > 1){
     box.innerHTML = `<span>${it.name} colours</span>`;
     it.colors.forEach((c,i) => {
       const d = document.createElement('button');
@@ -524,7 +741,7 @@ function cycleTop(step){
 }
 function addToBag(){
   const pieces = [S.top]; if (S.top.type!=='dress' && S.bottom) pieces.push(S.bottom);
-  for (const p of pieces) S.bag.push(`${p.name}${p.type!=='image' ? ', ' + p.colors[p.ci].name : ''}`);
+  for (const p of pieces) S.bag.push(`${p.name}${['garment','remote'].includes(p.type) ? '' : ', ' + p.colors[p.ci].name}`);
   $('#bagCount').textContent = `(${S.bag.length})`;
   $('#bagList').innerHTML = S.bag.map(x => `<li><span>${x}</span></li>`).join('');
   setPrompt('Added to your bag.'); setTimeout(()=>{ if ($('#prompt').textContent==='Added to your bag.') setPrompt(''); }, 1800);
@@ -558,3 +775,4 @@ $('#stage').addEventListener('click', e => {
 });
 if (!('documentPictureInPicture' in window)) document.querySelector('.tool[data-act="float"]').hidden = true;
 renderCatalog();
+updateRealFitButton();

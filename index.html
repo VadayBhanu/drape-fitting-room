@@ -8,6 +8,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Gloock&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#241024">
+<link rel="icon" href="icons/icon-192.png">
 </head>
 <body>
 <header>
@@ -51,7 +54,7 @@
         <div class="start" id="startOverlay">
           <div>
             <h2>Step into the fitting room</h2>
-            <p>Your camera stays on this device. Nothing is recorded or uploaded.</p>
+            <p>Live try-on stays on this device. Real fit sends three photos of you to the try-on service, only when you press Start real fit.</p>
             <button class="btn primary" id="startBtn">Open camera</button>
           </div>
         </div>
@@ -80,9 +83,48 @@
       <h4>Bottoms</h4>
       <div class="rail" id="railBottoms"></div>
       <div class="colours" id="colours"></div>
-      <label class="upload">Try your own product photo (a front view of a top works best)
-        <input type="file" accept="image/*" id="upload">
+      <label class="check"><input type="checkbox" id="hugToggle" checked> Shape clothes to my body outline</label>
+    </div>
+
+    <div class="panel-block">
+      <h3>Any clothes, from anywhere</h3>
+      <p class="note">Amazon, any shop, Instagram or your gallery. Copy the product photo, or save it and pick it here.</p>
+      <div class="source-row">
+        <label class="btn small file-btn">From gallery<input type="file" accept="image/*" id="upload"></label>
+        <button class="btn small" id="pasteBtn">Paste copied photo</button>
+      </div>
+      <div class="field link-field">
+        <label for="linkInput" class="sr">Image link</label>
+        <input id="linkInput" type="url" inputmode="url" placeholder="Paste an image link">
+        <button class="btn small" id="linkBtn">Add</button>
+      </div>
+      <p class="note">Live try-on works best with a photo of just the clothes on a plain background. Real fit works with any photo, including one worn by a model. On Android, install the app and use Share, then Drape, from your gallery or browser.</p>
+    </div>
+
+    <div class="panel-block">
+      <h3>Real fit</h3>
+      <p class="note">A photo-real view of you wearing the picked item, from the front, half-turned and side-on. Each view takes about 30 to 90 seconds.</p>
+      <label class="stack" for="rfDesc">What is it? (optional)
+        <input id="rfDesc" type="text" placeholder="Short sleeve round neck t-shirt">
       </label>
+      <button class="btn primary" id="rfBtn" style="width:100%;margin-top:10px" disabled>Start real fit</button>
+      <p class="note" id="rfHint"></p>
+      <div id="rfResults" class="turntable" hidden>
+        <p class="note" id="rfStatus" aria-live="polite"></p>
+        <img id="rfImg" alt="You wearing the picked item" hidden>
+        <p id="rfLabel" class="rf-label"></p>
+        <input type="range" id="rfSlider" min="0" max="0" step="1" value="0" aria-label="Turn around">
+      </div>
+      <details class="settings">
+        <summary>Real fit settings</summary>
+        <label class="stack" for="hfToken">Hugging Face token (raises the free GPU limit)
+          <input id="hfToken" type="password" autocomplete="off" placeholder="hf_…">
+        </label>
+        <label class="stack" for="rfSpace">Try-on model (Hugging Face Space)
+          <input id="rfSpace" type="text" autocomplete="off">
+        </label>
+        <p class="note">Your token is kept only in this browser.</p>
+      </details>
     </div>
 
     <div class="panel-block">
