@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Drape, a live fitting room</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Gloock&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>Drape</h1>
+  <p>A fitting room that sits beside your shop. Stand back, get recognised, try pieces on live, then move to see how they hang.</p>
+</header>
+
+<main>
+  <section id="stageHome">
+    <div class="mirror" id="stage">
+      <div class="glass" id="glass">
+        <canvas id="view" width="1280" height="800" aria-label="Live mirror view with clothes overlaid"></canvas>
+
+        <div class="toolbar">
+          <button class="tool" data-act="prev" disabled aria-label="Previous top">‹</button>
+          <button class="tool" data-act="next" disabled aria-label="Next top">›</button>
+          <button class="tool" data-act="beat" aria-pressed="false">Beat</button>
+          <button class="tool" data-act="photo" disabled>Photo</button>
+          <button class="tool" data-act="float">Float</button>
+        </div>
+
+        <div class="move-card" id="moveCard" hidden>
+          <div class="fig" id="moveFig"></div>
+          <div style="flex:1;min-width:0">
+            <p class="move-count" id="moveCount"></p>
+            <p class="move-label" id="moveLabel"></p>
+            <p class="move-hint" id="moveHint"></p>
+            <div class="bar"><i id="moveBar"></i></div>
+            <div class="move-actions" id="moveActions" hidden>
+              <button class="btn primary small" data-act="bagFromMove">Add to bag</button>
+              <button class="btn small" data-act="moveAgain">Run again</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="hud">
+          <div class="prompt" id="prompt" aria-live="polite"></div>
+          <button class="btn small" id="skipBtn" hidden>I'm sitting, use upper body only</button>
+        </div>
+
+        <div class="start" id="startOverlay">
+          <div>
+            <h2>Step into the fitting room</h2>
+            <p>Your camera stays on this device. Nothing is recorded or uploaded.</p>
+            <button class="btn primary" id="startBtn">Open camera</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="below">
+      <span>Best with your whole body in view, about two metres from the camera, in good light. On a phone, prop it upright against something at waist height.</span>
+      <span id="floatNote"></span>
+    </div>
+  </section>
+
+  <aside>
+    <div class="panel-block">
+      <ol class="steps" id="steps">
+        <li data-step="1" class="now">Stand in the frame</li>
+        <li data-step="2">Try things on</li>
+        <li data-step="3">Move in them</li>
+      </ol>
+      <button class="btn primary" id="moveBtn" style="margin-top:12px;width:100%" disabled>Start the move test</button>
+    </div>
+
+    <div class="panel-block">
+      <h3>On the rail</h3>
+      <h4>Tops and dresses</h4>
+      <div class="rail" id="railTops"></div>
+      <h4>Bottoms</h4>
+      <div class="rail" id="railBottoms"></div>
+      <div class="colours" id="colours"></div>
+      <label class="upload">Try your own product photo (a front view of a top works best)
+        <input type="file" accept="image/*" id="upload">
+      </label>
+    </div>
+
+    <div class="panel-block">
+      <h3>Your size</h3>
+      <div class="field"><label for="height">Height</label><input id="height" type="number" inputmode="numeric" min="120" max="220" placeholder="170"> cm</div>
+      <p class="size-out" id="sizeOut">Enter your height, then stand in the frame.</p>
+    </div>
+
+    <div class="panel-block">
+      <h3>Bag <span id="bagCount" style="color:var(--muted);font-family:Manrope;font-size:15px"></span></h3>
+      <button class="btn small" id="addBag" disabled>Add this outfit</button>
+      <ul class="bag-list" id="bagList"></ul>
+    </div>
+  </aside>
+</main>
+
+<script>
+  // shown if the tracking library never loads
+  setTimeout(function(){ if(!window.__drapeReady){ var p=document.getElementById('prompt'); p.textContent='Body tracking failed to load. Check your internet connection and reload.'; p.dataset.tone='warn'; } }, 9000);
+</script>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>

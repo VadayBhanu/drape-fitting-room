@@ -1,0 +1,560 @@
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import { add, sub, mul, lerp, mid, access, computeGeom, positionCheck, sizeEstimate,
+  bodyPxFromSpan, swayStep, newSway, MOVE_CHECKS, swayProgress } from "./geometry.js";
+import { CATALOG, OPTS } from "./catalog.js";
+window.__drapeReady = true;
+
+const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const IS_PHONE = matchMedia("(pointer:coarse)").matches && Math.min(screen.width,screen.height) < 820;
+const MODEL = `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${IS_PHONE?"lite":"full"}/float16/1/pose_landmarker_${IS_PHONE?"lite":"full"}.task`;
+
+const $ = s => document.querySelector(s);
+const canvas = $('#view'), ctx = canvas.getContext('2d');
+const video = Object.assign(document.createElement('video'), { playsInline:true, muted:true, autoplay:true });
+video.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none';
+document.body.append(video);
+
+/* ---------- state ---------- */
+const S = {
+  phase:'idle', lm:null, lastSeen:0, lastT:0, hold:0, lock:null,
+  top:CATALOG.tops[2], bottom:CATALOG.bottoms[0], editing:CATALOG.tops[2],
+  bag:[], sway:newSway(),
+  move:{on:false,list:[],i:0,hold:0,passedAt:0,done:false,sw:null},
+};
+let landmarker, rafHost = window, loopGen = 0, pipWin = null, patternMtx = new DOMMatrix();
+
+/* ---------- fabric patterns ---------- */
+const patCache = new Map();
+function tile(item){
+  const c = item.colors[item.ci], key = item.id + item.ci;
+  if (patCache.has(key)) return patCache.get(key);
+  const t = document.createElement('canvas'); t.width = t.height = 64;
+  const g = t.getContext('2d');
+  g.fillStyle = c.base; g.fillRect(0,0,64,64);
+  const a = c.accent || '#000';
+  if (item.pattern === 'stripe'){ g.fillStyle = a; for (let y=4;y<64;y+=16) g.fillRect(0,y,64,7); }
+  if (item.pattern === 'check'){
+    g.fillStyle = a; g.globalAlpha=.42;
+    for (let x=0;x<64;x+=32) g.fillRect(x,0,16,64);
+    for (let y=0;y<64;y+=32) g.fillRect(0,y,64,16);
+    g.globalAlpha=1;
+  }
+  if (item.pattern === 'block'){
+    g.fillStyle = a;
+    for (const [cx,cy] of [[16,16],[48,48]]){
+      for (let k=0;k<6;k++){ const an=k*Math.PI/3; g.beginPath(); g.arc(cx+Math.cos(an)*5.5, cy+Math.sin(an)*5.5, 3.2, 0, 7); g.fill(); }
+      g.beginPath(); g.arc(cx,cy,2.2,0,7); g.fill();
+    }
+    for (const [x,y] of [[48,16],[16,48]]){ g.beginPath(); g.arc(x,y,1.6,0,7); g.fill(); }
+  }
+  if (item.pattern === 'denim' || item.pattern === 'twill'){
+    g.strokeStyle = item.pattern==='denim' ? 'rgba(255,255,255,.13)' : 'rgba(0,0,0,.12)';
+    g.lineWidth = 1.2;
+    for (let i=-64;i<64;i+= item.pattern==='denim'?4:6){ g.beginPath(); g.moveTo(i,64); g.lineTo(i+64,0); g.stroke(); }
+  }
+  for (let i=0;i<260;i++){ g.fillStyle = Math.random()<.5?'rgba(255,255,255,.035)':'rgba(0,0,0,.05)'; g.fillRect(Math.random()*64,Math.random()*64,1.4,1.4); }
+  patCache.set(key, t);
+  return t;
+}
+function pattern(item){
+  const p = ctx.createPattern(tile(item), 'repeat');
+  p.setTransform(patternMtx);
+  return p;
+}
+
+/* ---------- landmarks ---------- */
+const W = () => canvas.width, H = () => canvas.height;
+const vis = (i,t=.4) => access(S.lm, W(), H()).vis(i,t);
+const P = i => access(S.lm, W(), H()).P(i);
+const geom = () => computeGeom(S.lm, W(), H(), S.sway.off);
+/* ---------- drawing garments ---------- */
+function torsoPath(g, o){
+  const {E,u,d,uh} = g, lift = mul(d,-E*.06);
+  const sL = add(g.ls, mul(u,E*o.sh), lift), sR = add(g.rs, mul(u,-E*o.sh), lift);
+  const nL = add(g.sc, mul(u,E*o.nw), mul(d,-E*.13)), nR = add(g.sc, mul(u,-E*o.nw), mul(d,-E*.13));
+  const nC = add(g.sc, mul(d,E*(o.neck-.13)));
+  const aL = add(g.ls, mul(u,E*.05), mul(d,E*.45)), aR = add(g.rs, mul(u,-E*.05), mul(d,E*.45));
+  const half = Math.max(g.hw/2 + E*.16, E*.46);
+  const hL = add(g.hc, mul(uh,half)), hR = add(g.hc, mul(uh,-half));
+  const wL = add(lerp(aL,hL,.55), mul(u,-E*o.fit)), wR = add(lerp(aR,hR,.55), mul(u,E*o.fit));
+  const hemLen = o.len * g.thigh, sw = mul(uh, g.swayOff*o.swing);
+  const eL = add(hL, mul(d,hemLen), mul(uh,E*o.flare), sw), eR = add(hR, mul(d,hemLen), mul(uh,-E*o.flare), sw);
+  const eC = add(g.hc, mul(d,hemLen + E*o.curve), mul(sw,1.15));
+  const p = new Path2D();
+  p.moveTo(nR.x,nR.y); p.quadraticCurveTo(nC.x,nC.y,nL.x,nL.y);
+  p.lineTo(sL.x,sL.y);
+  const cL = add(sL, mul(d,E*.25)); p.quadraticCurveTo(cL.x,cL.y,aL.x,aL.y);
+  p.quadraticCurveTo(wL.x,wL.y,hL.x,hL.y);
+  const mL = add(lerp(hL,eL,.5), mul(sw,-.3)); p.quadraticCurveTo(mL.x,mL.y,eL.x,eL.y);
+  const hc2 = sub(mul(eC,2), mid(eL,eR)); p.quadraticCurveTo(hc2.x,hc2.y,eR.x,eR.y);
+  const mR = add(lerp(hR,eR,.5), mul(sw,-.3)); p.quadraticCurveTo(mR.x,mR.y,hR.x,hR.y);
+  p.quadraticCurveTo(wR.x,wR.y,aR.x,aR.y);
+  const cR = add(sR, mul(d,E*.25)); p.quadraticCurveTo(cR.x,cR.y,sR.x,sR.y);
+  p.closePath();
+  return {p,nL,nR,nC,wL,wR,eC};
+}
+
+function fillShaded(path, item, g){
+  ctx.fillStyle = pattern(item); ctx.fill(path);
+  ctx.save(); ctx.clip(path);
+  const a = add(g.sc, mul(g.u, g.E*.95)), b = add(g.sc, mul(g.u, -g.E*.95));
+  const gr = ctx.createLinearGradient(a.x,a.y,b.x,b.y);
+  gr.addColorStop(0,'rgba(0,0,0,.38)'); gr.addColorStop(.22,'rgba(0,0,0,0)');
+  gr.addColorStop(.48,'rgba(255,255,255,.07)'); gr.addColorStop(.78,'rgba(0,0,0,0)'); gr.addColorStop(1,'rgba(0,0,0,.38)');
+  ctx.fillStyle = gr; ctx.fillRect(0,0,W(),H());
+  ctx.restore();
+  ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(0,0,0,.28)'; ctx.stroke(path);
+}
+
+function limb(points, widths, item){
+  ctx.lineJoin = 'round';
+  for (let pass=0; pass<2; pass++){
+    for (let i=0;i<points.length-1;i++){
+      ctx.beginPath(); ctx.moveTo(points[i].x,points[i].y); ctx.lineTo(points[i+1].x,points[i+1].y);
+      ctx.lineCap = i === points.length-2 ? 'butt' : 'round';
+      ctx.lineWidth = widths[i] + (pass===0 ? 4 : 0);
+      ctx.strokeStyle = pass===0 ? 'rgba(0,0,0,.3)' : pattern(item);
+      ctx.stroke();
+    }
+  }
+}
+
+function sleeve(g, side, item, o){
+  if (!o.sleeve) return;
+  const L = side==='L', sh = L?g.ls:g.rs, el = L?g.le:g.re, wr = L?g.lw:g.rw, ev = L?g.leV:g.reV;
+  const out = L ? g.u : mul(g.u,-1);
+  const start = add(sh, mul(out,g.E*.05), mul(g.d,g.E*.03));
+  const pts = [start];
+  if (!ev) pts.push(add(start, mul(g.d, g.E*.4*Math.min(1,o.sleeve))));
+  else if (o.sleeve <= 1) pts.push(lerp(sh,el,o.sleeve));
+  else { pts.push(el); pts.push(lerp(el,wr,Math.min(1,o.sleeve-1))); }
+  limb(pts, o.sleeve<=1 ? [g.E*.42] : [g.E*.37, g.E*.28], item);
+}
+const armInFront = (g, side) => {
+  const s = S.lm[side==='L'?11:12].z, w = S.lm[side==='L'?15:16].z;
+  return (side==='L'?g.lwV:g.rwV) && w < s - .25;
+};
+
+function pants(g, item){
+  if (!g.hipVis) return;
+  const {E,d,uh} = g;
+  const half = Math.max(g.hw/2 + E*.14, E*.44);
+  const wL = add(g.hc, mul(uh,half), mul(d,-E*.12)), wR = add(g.hc, mul(uh,-half), mul(d,-E*.12));
+  const crotch = add(g.hc, mul(d,E*.45));
+  for (const [hip,knee,ank] of [[g.lh,g.lk,g.la],[g.rh,g.rk,g.ra]]){
+    const top = add(hip, mul(d,E*.12));
+    limb([top, knee, lerp(knee,ank,.97)], [E*.6, E*.45], item);
+  }
+  const p = new Path2D();
+  p.moveTo(wL.x,wL.y); p.lineTo(wR.x,wR.y);
+  const r = add(g.rh, mul(d,E*.42), mul(uh,-E*.28)), l = add(g.lh, mul(d,E*.42), mul(uh,E*.28));
+  p.lineTo(r.x,r.y); p.lineTo(crotch.x,crotch.y); p.lineTo(l.x,l.y); p.closePath();
+  ctx.fillStyle = pattern(item); ctx.fill(p);
+  ctx.strokeStyle='rgba(0,0,0,.35)'; ctx.lineWidth = E*.05;
+  ctx.beginPath(); ctx.moveTo(wL.x,wL.y); ctx.lineTo(wR.x,wR.y); ctx.stroke();
+}
+
+function details(g, item, t){
+  const c = item.colors[item.ci], {E,d,u} = g;
+  const neckLow = add(mul(t.nC,.5), mul(t.nL,.25), mul(t.nR,.25));
+  if (item.type === 'tee'){
+    ctx.strokeStyle='rgba(0,0,0,.25)'; ctx.lineWidth=E*.035;
+    ctx.beginPath(); ctx.moveTo(t.nR.x,t.nR.y); ctx.quadraticCurveTo(t.nC.x,t.nC.y,t.nL.x,t.nL.y); ctx.stroke();
+  }
+  if (item.type === 'kurta'){
+    const end = add(neckLow, mul(d,E*.42));
+    ctx.strokeStyle = c.accent; ctx.lineWidth = E*.05;
+    ctx.beginPath(); ctx.moveTo(neckLow.x,neckLow.y); ctx.lineTo(end.x,end.y); ctx.stroke();
+    ctx.fillStyle = c.base;
+    for (let k=1;k<=3;k++){ const b = lerp(neckLow,end,k/4); ctx.beginPath(); ctx.arc(b.x,b.y,E*.016,0,7); ctx.fill(); }
+  }
+  if (item.type === 'jacket'){
+    const V0 = add(g.sc, mul(d, g.torsoLen*.55));
+    ctx.fillStyle = '#ece6da';
+    ctx.beginPath(); ctx.moveTo(t.nR.x,t.nR.y); ctx.lineTo(t.nL.x,t.nL.y); ctx.lineTo(V0.x,V0.y); ctx.closePath(); ctx.fill();
+    for (const s of [1,-1]){
+      const n = s>0 ? t.nL : t.nR, tip = add(n, mul(u,E*.13*s), mul(d,E*.32));
+      ctx.beginPath(); ctx.moveTo(n.x,n.y); ctx.lineTo(tip.x,tip.y); ctx.lineTo(V0.x,V0.y); ctx.closePath();
+      ctx.fillStyle = pattern(item); ctx.fill(); ctx.fillStyle='rgba(0,0,0,.22)'; ctx.fill();
+    }
+    ctx.strokeStyle='rgba(0,0,0,.35)'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(V0.x,V0.y); ctx.lineTo(t.eC.x,t.eC.y); ctx.stroke();
+    ctx.fillStyle='#2a2826';
+    for (const k of [.25,.6]){ const b = lerp(V0,t.eC,k); ctx.beginPath(); ctx.arc(b.x,b.y,E*.032,0,7); ctx.fill(); }
+  }
+  if (item.type === 'dress'){
+    ctx.strokeStyle='rgba(0,0,0,.25)'; ctx.lineWidth=E*.03;
+    ctx.beginPath(); ctx.moveTo(t.wL.x,t.wL.y); ctx.lineTo(t.wR.x,t.wR.y); ctx.stroke();
+  }
+}
+
+function drawImageTop(g, item){
+  const img = item.img, w = g.E*1.95, h = w * img.height / img.width;
+  const top = add(g.sc, mul(g.d, -g.E*.2));
+  ctx.save(); ctx.translate(top.x, top.y); ctx.rotate(Math.atan2(g.u.y,g.u.x));
+  ctx.drawImage(img, -w/2, 0, w, h); ctx.restore();
+}
+
+function drawOutfit(g, dt){
+  swayStep(S.sway, g.hc.x, dt, g.E); g.swayOff = S.sway.off;
+  patternMtx = new DOMMatrix().translateSelf(g.sc.x,g.sc.y).rotateSelf(Math.atan2(g.u.y,g.u.x)*180/Math.PI).scaleSelf(g.E/180);
+  const top = S.top;
+  if (top.type !== 'dress' && S.bottom) pants(g, S.bottom);
+  if (top.type === 'image'){ drawImageTop(g, top); return; }
+  const o = OPTS[top.type];
+  const front = {L:armInFront(g,'L'), R:armInFront(g,'R')};
+  for (const s of ['L','R']) if (!front[s]) sleeve(g, s, top, o);
+  const t = torsoPath(g, o);
+  fillShaded(t.p, top, g);
+  details(g, top, t);
+  for (const s of ['L','R']) if (front[s]) sleeve(g, s, top, o);
+}
+
+/* ---------- positioning ---------- */
+function drawTape(ok, progress){
+  const w = W(), h = H();
+  for (const x of [w*.31, w*.69]){
+    ctx.fillStyle = ok ? 'rgba(233,207,147,.92)' : 'rgba(217,226,229,.35)';
+    ctx.fillRect(x-7, h*.03, 14, h*.94);
+    ctx.fillStyle = 'rgba(36,16,36,.75)';
+    for (let i=0;i<=60;i++){ const y = h*.03 + i*(h*.94/60); ctx.fillRect(i%5===0 ? x-7 : x-7, y, i%5===0?10:5, 1.5); }
+  }
+  if (progress > 0 && S.lm){
+    const n = P(0), r = Math.max(22, w*.025);
+    ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(255,255,255,.15)';
+    ctx.beginPath(); ctx.arc(n.x, n.y - r*3, r, 0, 7); ctx.stroke();
+    ctx.strokeStyle = '#e9cf93';
+    ctx.beginPath(); ctx.arc(n.x, n.y - r*3, r, -Math.PI/2, -Math.PI/2 + progress*Math.PI*2); ctx.stroke();
+  }
+}
+
+const BONES = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+function drawSkeleton(color, alpha){
+  if (!S.lm) return;
+  ctx.save(); ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 3;
+  for (const [a,b] of BONES){ if (vis(a)&&vis(b)){ const p=P(a), q=P(b); ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(q.x,q.y); ctx.stroke(); } }
+  for (const i of [0,11,12,13,14,15,16,23,24,25,26,27,28]) if (vis(i)){ const p=P(i); ctx.beginPath(); ctx.arc(p.x,p.y,5,0,7); ctx.fill(); }
+  ctx.restore();
+}
+
+function lockOn(full, span){
+  const g = geom(); if (!g) return;
+  S.lock = { full, sw:g.sw, bodyPx: full ? bodyPxFromSpan(span, H()) : null, t:performance.now() };
+  S.phase = 'tryon';
+  $('#skipBtn').hidden = true;
+  setStep(2);
+  setPrompt('Got you. Pick something from the rail.');
+  setTimeout(()=>{ if (S.phase==='tryon' && !S.move.on) setPrompt(''); }, 2600);
+  for (const b of document.querySelectorAll('.tool[data-act="prev"],.tool[data-act="next"],.tool[data-act="photo"]')) b.disabled = false;
+  $('#moveBtn').disabled = false; $('#addBag').disabled = false;
+  updateSize();
+}
+
+/* ---------- move test ---------- */
+const fig = (arms, legs, extra='') => `<svg viewBox="0 0 40 48" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="20" cy="7" r="4"/><path d="M20 11v17"/><path d="${arms}"/><path d="${legs}"/>${extra}</svg>`;
+const LEGS = 'M20 28l-6 16M20 28l6 16';
+const MOVES = [
+  {label:'Raise both arms', hint:'See how the hem lifts.', hold:.6, icon:fig('M20 15l-8-12M20 15l8-12',LEGS),
+    check:MOVE_CHECKS.armsUp},
+  {label:'Arms out to the sides', hint:'Check the sleeves and shoulders.', hold:.6, icon:fig('M4 15h32',LEGS),
+    check:MOVE_CHECKS.armsOut},
+  {label:'Hands on your hips', hint:'Watch the waist and fit.', hold:.6, icon:fig('M20 15l-8 7 5 6M20 15l8 7-5 6',LEGS),
+    check:MOVE_CHECKS.handsOnHips},
+  {label:'Turn to your side', hint:'See the fit in profile.', hold:.5, icon:fig('M20 15l2 12',LEGS,'<path d="M6 30c-3-6 0-12 6-14" stroke-dasharray="2 3"/>'),
+    check:g=> MOVE_CHECKS.turn(g, S.lock)},
+  {label:'Sway left, then right', hint:'Watch the fabric swing.', sway:true, icon:fig('M20 15l-7 9M20 15l7 9',LEGS,'<path d="M3 40h6M31 40h6"/>')},
+  {label:'Lift one knee', hint:'Check how it moves with your stride.', hold:.4, needsLegs:true, icon:fig('M20 15l-7 9M20 15l7 9','M20 28l-6 16M20 28l8 4-3 8'),
+    check:MOVE_CHECKS.knee},
+];
+
+function startMoves(){
+  const m = S.move;
+  Object.assign(m, {on:true, list:MOVES.filter(x=>!x.needsLegs || S.lock.full), i:0, hold:0, passedAt:0, done:false, sw:null});
+  $('#moveCard').hidden = false; $('#moveActions').hidden = true;
+  setStep(3); setPrompt(''); renderMove();
+}
+function renderMove(){
+  const m = S.move, cur = m.list[m.i];
+  $('#moveFig').innerHTML = cur.icon;
+  $('#moveCount').textContent = `Move ${m.i+1} of ${m.list.length}`;
+  $('#moveLabel').textContent = cur.label;
+  $('#moveHint').textContent = cur.hint;
+  $('#moveBar').style.width = '0%';
+}
+function updateMoves(g, dt, now){
+  const m = S.move; if (!m.on || m.done) return;
+  if (m.passedAt){
+    if (now - m.passedAt > 700){
+      m.passedAt = 0; m.i++; m.hold = 0; m.sw = null;
+      if (m.i >= m.list.length){ finishMoves(); return; }
+      renderMove();
+    }
+    return;
+  }
+  const cur = m.list[m.i]; let prog = 0;
+  if (!g){ $('#moveBar').style.width = '0%'; return; }
+  if (cur.sway){
+    if (!m.sw) m.sw = {};
+    prog = swayProgress(m.sw, g);
+  } else {
+    m.hold = cur.check(g) ? m.hold + dt : Math.max(0, m.hold - dt*2);
+    prog = Math.min(1, m.hold / cur.hold);
+  }
+  $('#moveBar').style.width = (prog*100).toFixed(0) + '%';
+  if (prog >= 1){ m.passedAt = now; $('#moveLabel').textContent = 'Nice.'; $('#moveHint').textContent = ''; }
+}
+function finishMoves(){
+  const m = S.move; m.done = true;
+  $('#moveFig').innerHTML = fig('M20 15l-8-12M20 15l8-12', LEGS);
+  $('#moveCount').textContent = 'Move test complete';
+  $('#moveLabel').textContent = `${S.top.name} passed`;
+  $('#moveHint').textContent = 'You have seen it move. Keep it or try another piece.';
+  $('#moveBar').style.width = '100%';
+  $('#moveActions').hidden = false;
+}
+
+/* ---------- beat (Web Audio, scheduled from the render loop) ---------- */
+const beat = {on:false, ac:null, next:0, step:0, kicks:[]};
+function toggleBeat(btn){
+  beat.ac ??= new (window.AudioContext || window.webkitAudioContext)();
+  beat.on = !beat.on; btn.setAttribute('aria-pressed', beat.on);
+  if (beat.on){ beat.ac.resume(); beat.next = beat.ac.currentTime + .05; beat.step = 0; }
+}
+function noise(ac, dur){
+  const b = ac.createBuffer(1, ac.sampleRate*dur, ac.sampleRate), d = b.getChannelData(0);
+  for (let i=0;i<d.length;i++) d[i] = Math.random()*2-1;
+  const s = ac.createBufferSource(); s.buffer = b; return s;
+}
+function scheduleBeat(){
+  if (!beat.on) return;
+  const ac = beat.ac, stepDur = 60/104/2;
+  while (beat.next < ac.currentTime + .15){
+    const t = beat.next, s = beat.step % 16;
+    if (s % 4 === 0){
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.frequency.setValueAtTime(140,t); o.frequency.exponentialRampToValueAtTime(45,t+.14);
+      g.gain.setValueAtTime(.8,t); g.gain.exponentialRampToValueAtTime(.001,t+.25);
+      o.connect(g).connect(ac.destination); o.start(t); o.stop(t+.26); beat.kicks.push(t);
+    }
+    if (s % 2 === 1){
+      const n = noise(ac,.05), f = ac.createBiquadFilter(), g = ac.createGain();
+      f.type='highpass'; f.frequency.value=7000; g.gain.setValueAtTime(.18,t); g.gain.exponentialRampToValueAtTime(.001,t+.05);
+      n.connect(f).connect(g).connect(ac.destination); n.start(t);
+    }
+    if (s === 4 || s === 12){
+      const n = noise(ac,.18), f = ac.createBiquadFilter(), g = ac.createGain();
+      f.type='bandpass'; f.frequency.value=1600; g.gain.setValueAtTime(.35,t); g.gain.exponentialRampToValueAtTime(.001,t+.18);
+      n.connect(f).connect(g).connect(ac.destination); n.start(t);
+    }
+    beat.next += stepDur; beat.step++;
+  }
+  const now = ac.currentTime; beat.kicks = beat.kicks.filter(k => k > now - .4);
+  const last = beat.kicks.filter(k => k <= now).pop();
+  const p = last != null ? Math.max(0, 1 - (now-last)/.3) : 0;
+  if (!matchMedia('(prefers-reduced-motion: reduce)').matches) $('#stage').style.setProperty('--pulse', p.toFixed(2));
+}
+
+/* ---------- main loop ---------- */
+function frame(now){
+  const dt = Math.min(.05, (now - (S.lastT||now)) / 1000); S.lastT = now;
+  const w = W(), h = H();
+  ctx.save(); ctx.translate(w,0); ctx.scale(-1,1); ctx.drawImage(video,0,0,w,h); ctx.restore();
+
+  if (landmarker && video.readyState >= 2){
+    const res = landmarker.detectForVideo(video, now);
+    const lm = res.landmarks && res.landmarks[0];
+    if (lm){
+      if (!S.lm) S.lm = lm.map(p => ({...p}));
+      else for (let i=0;i<lm.length;i++){ const s=S.lm[i], n=lm[i]; s.x+=(n.x-s.x)*.55; s.y+=(n.y-s.y)*.55; s.z+=(n.z-s.z)*.55; s.visibility=n.visibility; }
+      S.lastSeen = now;
+    } else if (now - S.lastSeen > 400) S.lm = null;
+  }
+
+  if (S.phase === 'position'){
+    const c = positionCheck(S.lm, W(), H());
+    S.hold = c.ok ? S.hold + dt : Math.max(0, S.hold - dt*2);
+    drawSkeleton('#d9e2e5', .7);
+    drawTape(c.ok, Math.min(1, S.hold/1.3));
+    setPrompt(c.msg);
+    if (S.hold >= 1.3) lockOn(true, c.span);
+  } else if (S.phase === 'tryon'){
+    const g = geom();
+    if (g) drawOutfit(g, dt);
+    const since = now - S.lock.t;
+    if (since < 1000) drawSkeleton('#e9cf93', 1 - since/1000);
+    if (!S.lm && now - S.lastSeen > 2000) setPrompt('Step back into the frame.', 'warn');
+    else if ($('#prompt').dataset.tone === 'warn') setPrompt('');
+    updateMoves(g, dt, now);
+  }
+  scheduleBeat();
+}
+function loop(gen){
+  if (gen !== loopGen) return;
+  frame(performance.now());
+  rafHost.requestAnimationFrame(() => loop(gen));
+}
+function restartLoop(){ loopGen++; const gen = loopGen; rafHost.requestAnimationFrame(() => loop(gen)); }
+
+/* ---------- start ---------- */
+async function start(){
+  const btn = $('#startBtn'); btn.disabled = true;
+  if (!navigator.mediaDevices?.getUserMedia){ setPrompt('This browser cannot open the camera here. Open the file in Chrome, or serve it from localhost.', 'warn'); btn.disabled=false; return; }
+  setPrompt('Opening camera…');
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: matchMedia('(orientation: portrait)').matches ? { width:{ideal:720}, height:{ideal:1280}, facingMode:'user' } : { width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+    await video.play();
+  } catch {
+    setPrompt('Camera access was blocked. Allow the camera in the address bar, then press Open camera again.', 'warn');
+    btn.disabled = false; return;
+  }
+  canvas.width = video.videoWidth || 1280; canvas.height = video.videoHeight || 720;
+  $('#glass').style.setProperty('--ar', `${canvas.width}/${canvas.height}`);
+  setPrompt('Loading body tracking…');
+  try {
+    const fs = await FilesetResolver.forVisionTasks(WASM);
+    const make = delegate => PoseLandmarker.createFromOptions(fs, { baseOptions:{ modelAssetPath:MODEL, delegate }, runningMode:'VIDEO', numPoses:1 });
+    landmarker = await make('GPU').catch(() => make('CPU'));
+  } catch {
+    setPrompt('Body tracking could not load. Check your connection and reload.', 'warn'); return;
+  }
+  $('#startOverlay').hidden = true; $('#skipBtn').hidden = false;
+  S.phase = 'position'; setStep(1); restartLoop();
+}
+
+/* ---------- floating window ---------- */
+async function float(){
+  if (!('documentPictureInPicture' in window)){
+    toastFloat('Floating needs Chrome or Edge on desktop. You can also drag this tab into its own window and set it beside your shop.');
+    return;
+  }
+  if (pipWin){ pipWin.close(); return; }
+  const stage = $('#stage');
+  pipWin = await documentPictureInPicture.requestWindow({ width: 400, height: 640 });
+  for (const ss of document.styleSheets){
+    try { const st = pipWin.document.createElement('style'); st.textContent = [...ss.cssRules].map(r=>r.cssText).join('\n'); pipWin.document.head.append(st); }
+    catch { const l = pipWin.document.createElement('link'); l.rel='stylesheet'; l.href=ss.href; pipWin.document.head.append(l); }
+  }
+  pipWin.document.body.classList.add('pip');
+  pipWin.document.body.append(stage);
+  rafHost = pipWin; restartLoop();
+  toastFloat('The mirror is floating. Browse your shop and it stays on top.');
+  pipWin.addEventListener('pagehide', () => {
+    $('#stageHome').prepend(stage); pipWin = null; rafHost = window; restartLoop(); toastFloat('');
+  });
+}
+function toastFloat(t){ $('#floatNote').textContent = t; }
+
+/* ---------- own product photo ---------- */
+function cutBackground(img){
+  const max = 640, sc = Math.min(1, max/Math.max(img.width,img.height));
+  const w = Math.round(img.width*sc), h = Math.round(img.height*sc);
+  const c = document.createElement('canvas'); c.width=w; c.height=h;
+  const g = c.getContext('2d'); g.drawImage(img,0,0,w,h);
+  const id = g.getImageData(0,0,w,h), d = id.data, seen = new Uint8Array(w*h);
+  const ref = [d[0],d[1],d[2]], tol = 110;
+  const stack = [0, w-1, (h-1)*w, h*w-1];
+  while (stack.length){
+    const i = stack.pop(); if (i<0 || i>=w*h || seen[i]) continue; seen[i]=1;
+    const k = i*4, diff = Math.abs(d[k]-ref[0])+Math.abs(d[k+1]-ref[1])+Math.abs(d[k+2]-ref[2]);
+    if (d[k+3] > 10 && diff > tol) continue;
+    d[k+3] = 0;
+    const x = i % w;
+    if (x>0) stack.push(i-1); if (x<w-1) stack.push(i+1); stack.push(i-w, i+w);
+  }
+  g.putImageData(id,0,0);
+  let x0=w,y0=h,x1=0,y1=0;
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++) if (d[(y*w+x)*4+3]>10){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+  if (x1<=x0 || y1<=y0) return c;
+  const out = document.createElement('canvas'); out.width=x1-x0+1; out.height=y1-y0+1;
+  out.getContext('2d').drawImage(c, x0,y0,out.width,out.height, 0,0,out.width,out.height);
+  return out;
+}
+$('#upload').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image();
+  img.onload = () => {
+    const item = { id:'own'+Date.now(), name:'Your product', price:'', type:'image', img:cutBackground(img), ci:0, colors:[{name:'As photographed', base:'#777'}] };
+    CATALOG.tops.push(item); S.top = item; S.editing = item; renderCatalog();
+    URL.revokeObjectURL(img.src);
+  };
+  img.src = URL.createObjectURL(f);
+});
+
+/* ---------- UI ---------- */
+function setPrompt(t, tone){ const p = $('#prompt'); if (p.textContent !== t) p.textContent = t; p.dataset.tone = tone || ''; }
+function setStep(n){
+  for (const li of document.querySelectorAll('#steps li')){
+    const s = +li.dataset.step; li.className = s < n ? 'done' : s === n ? 'now' : '';
+  }
+}
+function swatchBg(item){
+  if (item.type==='image') return `center/cover url(${item.img.toDataURL()})`;
+  const c = item.colors[item.ci];
+  return c.accent ? `linear-gradient(135deg, ${c.base} 50%, ${c.accent} 50%)` : c.base;
+}
+function renderCatalog(){
+  for (const [key, el] of [['tops', $('#railTops')], ['bottoms', $('#railBottoms')]]){
+    el.innerHTML = '';
+    for (const item of CATALOG[key]){
+      const b = document.createElement('button');
+      b.className = 'item' + (key==='bottoms' && S.top.type==='dress' ? ' off' : '');
+      b.setAttribute('aria-pressed', key==='tops' ? S.top===item : S.bottom===item);
+      b.innerHTML = `<span class="sw" style="background:${swatchBg(item)}"></span><span class="nm">${item.name}</span><span class="pr">${item.price}</span>`;
+      b.onclick = () => { if (key==='tops') S.top = item; else S.bottom = item; S.editing = item; renderCatalog(); };
+      el.append(b);
+    }
+  }
+  const it = S.editing, box = $('#colours'); box.innerHTML = '';
+  if (it && it.type !== 'image' && it.colors.length > 1){
+    box.innerHTML = `<span>${it.name} colours</span>`;
+    it.colors.forEach((c,i) => {
+      const d = document.createElement('button');
+      d.className = 'dot'; d.title = c.name; d.setAttribute('aria-label', c.name);
+      d.style.background = c.accent ? `linear-gradient(135deg, ${c.base} 50%, ${c.accent} 50%)` : c.base;
+      d.setAttribute('aria-pressed', it.ci===i);
+      d.onclick = () => { it.ci = i; renderCatalog(); };
+      box.append(d);
+    });
+  }
+}
+function cycleTop(step){
+  const t = CATALOG.tops, i = (t.indexOf(S.top) + step + t.length) % t.length;
+  S.top = t[i]; S.editing = t[i]; renderCatalog();
+  if (S.move.on && S.move.done) startMoves();
+}
+function addToBag(){
+  const pieces = [S.top]; if (S.top.type!=='dress' && S.bottom) pieces.push(S.bottom);
+  for (const p of pieces) S.bag.push(`${p.name}${p.type!=='image' ? ', ' + p.colors[p.ci].name : ''}`);
+  $('#bagCount').textContent = `(${S.bag.length})`;
+  $('#bagList').innerHTML = S.bag.map(x => `<li><span>${x}</span></li>`).join('');
+  setPrompt('Added to your bag.'); setTimeout(()=>{ if ($('#prompt').textContent==='Added to your bag.') setPrompt(''); }, 1800);
+}
+function updateSize(){
+  const h = +$('#height').value, out = $('#sizeOut');
+  if (!S.lock){ out.textContent = 'Enter your height, then stand in the frame.'; return; }
+  if (!S.lock.full){ out.textContent = 'Stand back with your whole body in view to get a size estimate.'; return; }
+  if (!h){ out.textContent = 'Enter your height to get a size estimate.'; return; }
+  const { cm, size } = sizeEstimate({ sw:S.lock.sw, bodyPx:S.lock.bodyPx, heightCm:h });
+  out.innerHTML = `Shoulders about <b>${Math.round(cm)} cm</b>. Try size <b>${size}</b>.<br><span class="note">A camera estimate. Check the brand's size chart before you buy.</span>`;
+}
+function photo(){
+  canvas.toBlob(b => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'drape-fit.png'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href), 2000); });
+}
+
+$('#startBtn').onclick = start;
+$('#skipBtn').onclick = () => { if (geom()) lockOn(false); else setPrompt('Show your shoulders to the camera first.'); };
+$('#moveBtn').onclick = startMoves;
+$('#addBag').onclick = addToBag;
+$('#height').addEventListener('input', updateSize);
+$('#stage').addEventListener('click', e => {
+  const act = e.target.closest('[data-act]')?.dataset.act; if (!act) return;
+  if (act==='prev') cycleTop(-1);
+  if (act==='next') cycleTop(1);
+  if (act==='beat') toggleBeat(e.target.closest('button'));
+  if (act==='photo') photo();
+  if (act==='float') float();
+  if (act==='bagFromMove') addToBag();
+  if (act==='moveAgain') startMoves();
+});
+if (!('documentPictureInPicture' in window)) document.querySelector('.tool[data-act="float"]').hidden = true;
+renderCatalog();
