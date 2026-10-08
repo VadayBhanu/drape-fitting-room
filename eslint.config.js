@@ -1,7 +1,7 @@
 import globals from "globals";
 export default [
   {
-    files: ["src/**/*.js", "tests/**/*.js"],
+    files: ["src/**/*.js", "tests/**/*.js", "widget/**/*.js"],
     languageOptions: {
       ecmaVersion: 2023, sourceType: "module",
       globals: { ...globals.browser, ...globals.node, documentPictureInPicture: "readonly" },

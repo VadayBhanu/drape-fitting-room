@@ -74,12 +74,30 @@ src/garment.js      cut out a clothing photo and find torso, sleeves, hem, legs
 src/warp.js         triangle-mesh warp of the photo onto the body, turning
 src/realfit.js      photo-real try-on through a Hugging Face Space
 sw.js, manifest     installable app + "Share to Drape"
+widget/             embeddable store widget: loader snippet + try-on page
 tests/              node:test unit tests
 ```
 
 ## Adding your products
 
 Edit `src/catalog.js`. Each item needs an `id`, `name`, `price`, a `type` (`tee`, `kurta`, `jacket`, `dress` for tops, `pants` for bottoms), a `pattern` (`solid`, `stripe`, `check`, `block`, `denim`, `twill`) and one or more `colors`. Run `npm test` after editing; the catalogue tests catch typos.
+
+## Embed on your store
+
+Drop the try-on on any product page (Shopify, WooCommerce, plain HTML).
+Full docs in `widget/README.md`:
+
+```html
+<script src="https://<your-host>/drape-fitting-room/widget/drape-widget.js"
+  data-image="https://your-shop.com/products/everyday-tee.jpg"
+  data-name="Everyday tee"
+  data-price="Rs 1,450"
+  data-url="https://your-shop.com/products/everyday-tee"></script>
+```
+
+Shoppers upload their photo, the AI drapes that product on them, and they get
+a before/after slider with a Buy button. Or link straight to a per-product
+try-on: `widget/embed.html?image=…&name=…&price=…&url=…`.
 
 ## Limits
 
